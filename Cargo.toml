@@ -1,0 +1,39 @@
+[package]
+name = "emb_pwm_f7"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+anyhow = { version = "1.0.71", default-features = false }
+
+defmt = "0.3.5"
+defmt-rtt = "0.4.0"
+cortex-m = { version = "0.7.7", features = ["critical-section-single-core"] }
+cortex-m-rt = "0.7.3"
+panic-probe = "0.3.1"
+
+[dependencies.embassy-sync]
+# git = "https://github.com/embassy-rs/embassy.git"
+path = "../embassy/embassy-sync"
+features = ["defmt"]
+
+[dependencies.embassy-stm32]
+# git = "https://github.com/embassy-rs/embassy.git"
+path = "../embassy/embassy-stm32"
+features = ["defmt", "stm32f767zi", "time-driver-any", "exti", "unstable-pac"]
+
+[dependencies.embassy-executor]
+# git = "https://github.com/embassy-rs/embassy.git"
+path = "../embassy/embassy-executor"
+features = [
+    "defmt",
+    "integrated-timers",
+    "arch-cortex-m",
+    "executor-thread",
+    "task-arena-size-32768",
+]
+
+[dependencies.embassy-time]
+# git = "https://github.com/embassy-rs/embassy.git"
+path = "../embassy/embassy-time"
+features = ["defmt"]
