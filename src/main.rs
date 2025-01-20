@@ -1,62 +1,34 @@
 #![no_std]
 #![no_main]
-#![feature(type_alias_impl_trait)]
-#![feature(int_roundings)]
 
-use defmt::*;
-use embassy_executor::{Spawner, task};
-use embassy_stm32::{
-    gpio::{AnyPin, Level, Output, Pin, Speed}, peripherals::TIM3, time::{khz, mhz, Hertz}, timer::{simple_pwm::{Ch1, Ch2, Ch3, Ch4, PwmPin}, Channel} 
-};
-
-
-// use embassy_stm32::timer::dshot::Dshot;
-use embassy_stm32::timer::simple_pwm::SimplePwm;
-
-use embassy_stm32::gpio::OutputType;
-use embassy_time::{Duration, Instant, Timer};
-
+use defmt::{panic, *};
+use embassy_executor::{task, Spawner};
+use embassy_futures::join::join;
+use embassy_stm32::gpio::{Level, Output, Speed};
+use embassy_stm32::time::Hertz;
+use embassy_stm32::usb::{Driver, Instance};
+use embassy_stm32::{bind_interrupts, peripherals, usb, Config};
+use embassy_time::{Duration, Timer};
+use embassy_usb::class::cdc_acm::{CdcAcmClass, State};
+use embassy_usb::driver::EndpointError;
+use embassy_usb::Builder;
+use postcard::from_bytes;
+use serde::{Deserialize, Serialize};
 use {defmt_rtt as _, panic_probe as _};
 
-const DSHOT_FRAME_SIZE: usize = 16; // 16 bits per frame
+bind_interrupts!(struct Irqs {
+    OTG_FS => usb::InterruptHandler<peripherals::USB_OTG_FS>;
+});
 
-static mut DSHOT_FRAMES: [u16; DSHOT_FRAME_SIZE * 4 + 8] = [0; DSHOT_FRAME_SIZE * 4 + 8];
-
-// Create DShot data packet
-fn create_dshot_packet(throttle: u16, telemetry: bool) -> u16 {
-    let mut packet = (throttle & 0x07FF) << 1; // 11-bit throttle
-    if telemetry {
-        packet |= 1; // Set telemetry bit if needed
-    }
-    let crc = ((packet ^ (packet >> 4) ^ (packet >> 8)) & 0x0F) as u16; // 4-bit CRC
-    (packet << 4) | crc
-}
-
-// Prepare DShot frame as array of pulse widths for each bit
-fn prepare_dshot_frame(packet: u16, one_third: u16, two_third: u16, ch: usize) {
-    for i in 0..(DSHOT_FRAME_SIZE) {
-        // Calculate each bit’s pulse width
-        let is_one = (packet & (1 << (15 - i))) != 0;
-        unsafe {
-            DSHOT_FRAMES[i * 4 + ch] = if is_one {
-                two_third // Set for ~62.5% high pulse
-            } else {
-                one_third // Set for ~37.5% high pulse
-            };
-        }
-    }
-}
-
-#[task]
-async fn blink(mut led: Output<'static>) {
-    loop {
-        led.set_high();
-        info!("*blink*");
-        Timer::after(Duration::from_millis(800)).await;
-        led.set_low();
-        Timer::after(Duration::from_millis(800)).await;
-    }
-}
+// #[task]
+// async fn blink(mut led: Output<'static>) {
+//     loop {
+//         led.set_high();
+//         Timer::after(Duration::from_millis(800)).await;
+//         led.set_low();
+//         Timer::after(Duration::from_millis(800)).await;
+//     }
+// }
 
 #[embassy_executor::main]
 async fn main(spawner: Spawner) {
@@ -81,63 +53,144 @@ async fn main(spawner: Spawner) {
         config.rcc.apb1_pre = APBPrescaler::DIV4;
         config.rcc.apb2_pre = APBPrescaler::DIV2;
         config.rcc.sys = Sysclk::PLL1_P;
+        config.rcc.mux.clk48sel = mux::Clk48sel::PLL1_Q;
     }
 
     let mut p = embassy_stm32::init(config);
     println!("hello");
 
-    let blue = Output::new(p.PB7, Level::Low, Speed::Low);
+    // spawner.spawn(blink(blue)).unwrap();
 
-    spawner.spawn(blink(blue)).unwrap();
+    // Create the driver, from the HAL.
+    let mut ep_out_buffer = [0u8; 256];
+    let mut config = embassy_stm32::usb::Config::default();
 
-    let pwm_pin1 = PwmPin::new_ch1(p.PA6, OutputType::PushPull);
-    let pwm_pin2 = PwmPin::new_ch2(p.PC7, OutputType::PushPull);
-    let pwm_pin3: PwmPin<'_, TIM3, Ch3> = PwmPin::new_ch3(p.PC8, OutputType::PushPull);
-    let pwm_pin4: PwmPin<'_, TIM3, Ch4> = PwmPin::new_ch4(p.PC9, OutputType::PushPull);
+    // Do not enable vbus_detection. This is a safe default that works in all boards.
+    // However, if your USB device is self-powered (can stay powered on if USB is unplugged), you need
+    // to enable vbus_detection to comply with the USB spec. If you enable it, the board
+    // has to support it or USB won't work at all. See docs on `vbus_detection` for details.
+    config.vbus_detection = true;
 
-    let mut pwm = SimplePwm::new(p.TIM3, Some(pwm_pin1), Some(pwm_pin2), Some(pwm_pin3), Some(pwm_pin4), khz(600), Default::default());
+    let driver = Driver::new_fs(p.USB_OTG_FS, Irqs, p.PA12, p.PA11, &mut ep_out_buffer, config);
 
-    let max = pwm.get_max_duty() as u16;
-    let one_third = max / 3;
-    let two_third = one_third * 2;
-    pwm.enable_all_channels();
+    // Create embassy-usb Config
+    let mut config = embassy_usb::Config::new(0xc0de, 0xcafe);
+    config.manufacturer = Some("Embassy");
+    config.product = Some("USB-serial example");
+    config.serial_number = Some("12345678");
 
-    let packet0 = create_dshot_packet(0, false);
-    
-    prepare_dshot_frame(packet0, one_third, two_third, 0);
-    prepare_dshot_frame(packet0, one_third, two_third, 1);
-    prepare_dshot_frame(packet0, one_third, two_third, 2);
-    prepare_dshot_frame(packet0, one_third, two_third, 3);
+    // Create embassy-usb DeviceBuilder using the driver and config.
+    // It needs some buffers for building the descriptors.
+    let mut config_descriptor = [0; 256];
+    let mut bos_descriptor = [0; 256];
+    let mut control_buf = [0; 64];
 
-    let inst = Instant::now();
+    let mut state = State::new();
 
-    let start_ch = Channel::Ch1;
-    let end_ch = Channel::Ch4; 
+    let mut builder = Builder::new(
+        driver,
+        config,
+        &mut config_descriptor,
+        &mut bos_descriptor,
+        &mut [], // no msos descriptors
+        &mut control_buf,
+    );
 
-    unsafe {
-        while (Instant::now() - inst) < Duration::from_secs(3) {
-            pwm.waveform_up(&mut p.DMA1_CH2, start_ch, end_ch, &DSHOT_FRAMES).await;
-            Timer::after(Duration::from_micros(50)).await;
+    // Create classes on the builder.
+    let mut class = CdcAcmClass::new(&mut builder, &mut state, 64);
+
+    // Build the builder.
+    let mut usb = builder.build();
+
+    // Run the USB device.
+    let usb_fut = usb.run();
+
+    let mut blue = Output::new(p.PB7, Level::Low, Speed::Low);
+    let mut red = Output::new(p.PB14, Level::Low, Speed::Low);
+    let mut green = Output::new(p.PB0, Level::Low, Speed::Low);
+
+    // Do stuff with the class!
+    let echo_fut = async {
+        loop {
+            class.wait_connection().await;
+            info!("Connected");
+            let _ = control_led(&mut class, &mut blue, &mut red, &mut green).await;
+            info!("Disconnected");
         }
-    }
+    };
 
-    unsafe {
-        for thr in (100..500).chain((100..500).rev()).cycle() {
-            let packet = create_dshot_packet(thr, false);
-
-            println!("{}", thr);
-
-            prepare_dshot_frame(packet, one_third, two_third, 0);
-            prepare_dshot_frame(packet, one_third, two_third, 1);
-            prepare_dshot_frame(packet, one_third, two_third, 2);
-            prepare_dshot_frame(packet, one_third, two_third, 3);
-
-            for _ in 0..100 {
-                pwm.waveform_up(&mut p.DMA1_CH2, start_ch, end_ch, &DSHOT_FRAMES).await;
-                Timer::after(Duration::from_micros(50)).await;
-            }
-        }
-    }
-    
+    // Run everything concurrently.
+    // If we had made everything `'static` above instead, we could do this using separate tasks instead.
+    join(usb_fut, echo_fut).await;
 }
 
+struct Disconnected {}
+
+impl From<EndpointError> for Disconnected {
+    fn from(val: EndpointError) -> Self {
+        match val {
+            EndpointError::BufferOverflow => panic!("Buffer overflow"),
+            EndpointError::Disabled => Disconnected {},
+        }
+    }
+}
+
+async fn echo<'d, T: Instance + 'd>(class: &mut CdcAcmClass<'d, Driver<'d, T>>) -> Result<(), Disconnected> {
+    let mut buf = [0; 64];
+    let hello = "hello, ".as_bytes();
+
+    let len = core::cmp::min(hello.len(), buf.len());
+    buf[..len].copy_from_slice(&hello[..len]);
+    info!("{:?}", buf);
+    loop {
+        let n = class.read_packet(&mut buf[len..]).await?;
+        let data = &buf[..(n + len)];
+        info!("data: {:x}", data);
+        class.write_packet(data).await?;
+        
+    }
+}
+
+#[derive(Serialize, Deserialize)]
+enum Led {
+    Red,
+    Blue,
+    Green
+}
+
+#[derive(Serialize, Deserialize)]
+enum Request {
+    TurnOn(Led),
+    TurnOff(Led)
+}
+
+async fn control_led<'d, T: Instance + 'd>(
+    class: &mut CdcAcmClass<'d, Driver<'d, T>>,
+    blue: &mut Output<'static>,
+    red: &mut Output<'static>,
+    green: &mut Output<'static>
+) -> Result<(), Disconnected> {
+    let mut buf = [0; 64];
+    loop {
+        let n = class.read_packet(&mut buf).await?;
+        let data = &buf[..n];
+        let command: Request = from_bytes(&data).unwrap();
+        match command {
+            Request::TurnOn(l) => {
+                match l {
+                    Led::Blue => blue.set_high(),
+                    Led::Red => red.set_high(),
+                    Led::Green => green.set_high(),
+                }
+            },
+            Request::TurnOff(l) => {
+                match l {
+                    Led::Blue => blue.set_low(),
+                    Led::Red => red.set_low(),
+                    Led::Green => green.set_low(),
+                }
+            },
+        };
+
+    }
+}
