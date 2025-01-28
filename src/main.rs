@@ -12,7 +12,7 @@ use embassy_time::{Duration, Timer};
 use embassy_usb::class::cdc_acm::{CdcAcmClass, State};
 use embassy_usb::driver::EndpointError;
 use embassy_usb::Builder;
-use postcard::from_bytes;
+use postcard::{from_bytes, to_vec};
 use serde::{Deserialize, Serialize};
 use {defmt_rtt as _, panic_probe as _};
 
@@ -29,6 +29,56 @@ bind_interrupts!(struct Irqs {
 //         Timer::after(Duration::from_millis(800)).await;
 //     }
 // }
+
+
+#[derive(Serialize, Deserialize)]
+enum E {
+    SomeError
+}
+
+#[derive(Serialize, Deserialize)]
+enum Request {
+    StartSending,
+    GetMessage,
+    SendingCompleted
+}
+
+#[derive(Serialize, Deserialize)]
+enum Response {
+    SendingStarted,
+    Message(Option<LogMessage>),
+}
+
+#[derive(Serialize, Deserialize, Debug, PartialEq, Copy, Clone)]
+pub enum LogMessage {
+    Accel {
+        x: f32,
+        y: f32,
+        z: f32,
+    },
+    Gyro {
+        x: f32,
+        y: f32,
+        z: f32,
+    },
+    Mag {
+        x: f32,
+        y: f32,
+        z: f32,
+    },
+    Motors {
+        m1: f32,
+        m2: f32,
+        m3: f32,
+        m4: f32,
+    },
+    Batt {
+        v: f32,
+        a: f32,
+    },
+}
+
+
 
 #[embassy_executor::main]
 async fn main(spawner: Spawner) {
@@ -105,16 +155,21 @@ async fn main(spawner: Spawner) {
     // Run the USB device.
     let usb_fut = usb.run();
 
-    let mut blue = Output::new(p.PB7, Level::Low, Speed::Low);
-    let mut red = Output::new(p.PB14, Level::Low, Speed::Low);
-    let mut green = Output::new(p.PB0, Level::Low, Speed::Low);
+    let mut messages = [
+        LogMessage::Accel { x: 123.3, y: 123.4, z: 123.68 },
+        LogMessage::Gyro { x: 13.123, y: 15.341, z: 56.543 },
+        LogMessage::Batt { v: 16.4, a: 52.6 },
+        LogMessage::Batt { v: 16.4, a: 52.6 },
+        LogMessage::Gyro { x: 13.123, y: 15.341, z: 56.543 },
+        LogMessage::Accel { x: 123.3, y: 123.4, z: 123.68 },
+    ];
 
     // Do stuff with the class!
     let echo_fut = async {
         loop {
             class.wait_connection().await;
             info!("Connected");
-            let _ = control_led(&mut class, &mut blue, &mut red, &mut green).await;
+            let _ = send_data(&mut class, &mut messages).await;
             info!("Disconnected");
         }
     };
@@ -151,46 +206,38 @@ async fn echo<'d, T: Instance + 'd>(class: &mut CdcAcmClass<'d, Driver<'d, T>>) 
     }
 }
 
-#[derive(Serialize, Deserialize)]
-enum Led {
-    Red,
-    Blue,
-    Green
-}
-
-#[derive(Serialize, Deserialize)]
-enum Request {
-    TurnOn(Led),
-    TurnOff(Led)
-}
-
-async fn control_led<'d, T: Instance + 'd>(
+async fn send_data<'d, T: Instance + 'd>(
     class: &mut CdcAcmClass<'d, Driver<'d, T>>,
-    blue: &mut Output<'static>,
-    red: &mut Output<'static>,
-    green: &mut Output<'static>
-) -> Result<(), Disconnected> {
+    messages: &[LogMessage]
+) -> Result<(), Disconnected>{
     let mut buf = [0; 64];
     loop {
         let n = class.read_packet(&mut buf).await?;
         let data = &buf[..n];
         let command: Request = from_bytes(&data).unwrap();
         match command {
-            Request::TurnOn(l) => {
-                match l {
-                    Led::Blue => blue.set_high(),
-                    Led::Red => red.set_high(),
-                    Led::Green => green.set_high(),
-                }
-            },
-            Request::TurnOff(l) => {
-                match l {
-                    Led::Blue => blue.set_low(),
-                    Led::Red => red.set_low(),
-                    Led::Green => green.set_low(),
-                }
-            },
-        };
+            Request::StartSending => {
+                println!("start");
 
+                let data = to_vec::<Response, 32>(&Response::SendingStarted).unwrap();
+                class.write_packet(&data).await?;
+
+                for message in messages.iter() {
+                    let response = Response::Message(Some(message.clone()));
+                    let data = to_vec::<Response, 32>(&response).unwrap();
+                    class.write_packet(&data).await?;
+                    let n = class.read_packet(&mut buf).await?;
+                    let data = &buf[..n];
+                    let command: Request = from_bytes(&data).unwrap();
+                    match command {
+                        Request::GetMessage => continue,
+                        _ => ()
+                    }
+                }
+                let data = to_vec::<Response, 32>(&Response::Message(None)).unwrap();
+                class.write_packet(&data).await?;
+            },
+            _ => ()
+        }
     }
 }
